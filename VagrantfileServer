@@ -1,0 +1,131 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+ # Box Settings
+  config.vm.box = "centos/7"
+
+  # Provider Settings
+  config.vm.provider "virtualbox" do |vb|
+   vb.memory = 4096
+   vb.cpus = 4
+  # vb.gui = true
+  end
+
+  # Network Settings
+  # config.vm.network "forwarded_port", guest: 80, host: 8080
+  # config.vm.network "forwarded_port", guest: 80, host: 8080, host_ip: "127.0.0.1"
+  # config.vm.network "private_network", ip: "192.168.33.10"
+  config.vm.network "private_network", ip: "192.168.33.10", virtualbox__intnet: "intnet"
+  config.vm.network "private_network", ip: "192.168.40.10", virtualbox__intnet: "intshared"
+
+  # config.vm.network "public_network"
+
+  # Folder Settings
+  # config.vm.synced_folder ".", "/var/www/htdocs"
+
+  #
+  # View the documentation for the provider you are using for more
+  # information on available options.
+
+  # Provision Settings
+  config.vm.provision "shell", inline: <<-SHELL
+# Package installations
+    yum -y update
+    yum -y install dnsmasq dnsmasq-utils syslinux  tftp-server tftp vsftpd syslinux-tftpboot ipxe-bootimgs git xz-devel genisoimage squid mod_fcgid lighttpd-fastcgi mod_fastcgi openvswitch libibverbs
+	yum -y install net-tools vim wget patch epel-release tcpdump
+    yum -y install lighttpd
+	yum -y install strongswan
+
+#iPxe configuration	
+	
+   cd /home/vagrant; 
+   git clone https://github.com/deepikakaushal39/RemoteBooting.git
+   git clone git://github.com/ipxe/ipxe.git;
+   cd ipxe;
+   git clone https://github.com/tjhacker/ipxehttpproxy.git;
+   yum -y group install "Development Tools"
+   patch -p1 < ipxehttpproxy/proxypatch.p;
+   cd src; touch demo.ipxe;
+   echo '#!ipxe' >> demo.ipxe; 
+   echo 'dhcp' >> demo.ipxe;
+   echo 'set http-proxy http://192.168.7.2:3128' >> demo.ipxe;
+   echo 'chain http://192.168.7.1/menu.ipxe' >> demo.ipxe;
+    make bin/undionly.kpxe EMBED=demo.ipxe;
+	yum -y install lighttpd;
+	
+	mv /var/www/lighttpd/ /var/www/htdocs/;
+    cp bin/undionly.kpxe /var/www/htdocs/;
+	cd /home/vagrant; 
+    cp RemoteBooting/ks /var/www/htdocs/;
+    echo '#!ipxe' >> /var/www/htdocs/menu.ipxe;
+    echo 'set http-proxy http://192.168.7.2:3128' >> /var/www/htdocs/menu.ipxe
+    echo 'set base http://mirror.centos.org/centos/7/os/x86_64' >> /var/www/htdocs/menu.ipxe
+    echo '# shell' >> /var/www/htdocs/menu.ipxe
+    #echo 'prompt -k 0x197e -t 2000 Press F12 to install dp CentOS... || exit' >> /var/www/htdocs/menu.ipxe
+    echo 'kernel ${base}/images/pxeboot/vmlinuz ks=http://192.168.7.1/ks proxy=http://192.168.7.2:3128 repo=${base}' >> /var/www/htdocs/menu.ipxe
+    echo 'initrd ${base}/images/pxeboot/initrd.img' >> /var/www/htdocs/menu.ipxe
+    echo 'boot' >> /var/www/htdocs/menu.ipxe
+    echo "reached 1!";
+    sed -i 's|server.document-root = server_root + "/lighttpd"|server.document-root = server_root + "/htdocs"|g' /etc/lighttpd/lighttpd.conf  
+	sed -i 's/server.use-ipv6 = "enable"/server.use-ipv6 = "disable"/' /etc/lighttpd/lighttpd.conf
+   systemctl restart lighttpd
+    sudo chmod -R 775 /var/www/htdocs;
+    sudo chmod 775 /var/www/htdocs/menu.ipxe;
+
+
+#squid configuration
+    echo "reached 3";
+    sed -i "s:\#cache_dir ufs /var/spool/squid 100 16 256:cache_dir ufs /var/spool/squid 100000 16 256:" /etc/squid/squid.conf;
+    echo "maximum_object_size 30 GB" >> /etc/squid/squid.conf;
+    echo "acl localnet src 192.168.33.0/16" >> /etc/squid/squid.conf;
+    echo "icp_port 3130" >> /etc/squid/squid.conf;
+    echo "icp_access allow localnet" >> /etc/squid/squid.conf;
+    squid -z; sleep 5;
+    systemctl enable squid;
+    systemctl start squid;
+    
+    echo "reached 4";
+	
+#VXLAN configuration	
+    sudo ip route add 192.168.43.0/24 via 192.168.40.20 dev eth2 
+    sudo ip link add vxlan0 type vxlan id 7 dev eth1 dstport 8472
+    sudo bridge fdb append to 00:00:00:00:00:00 dst 192.168.43.20 dev vxlan0
+    sudo  ip link set up dev vxlan0
+	
+#OpenvSwitch 
+    yum -y install https://repos.fedorapeople.org/repos/openstack/EOL/openstack-juno/epel-7/openvswitch-2.3.1-2.el7.x86_64.rpm
+	systemctl enable openvswitch
+	  systemctl start openvswitch
+	ovs-vsctl add-br ovsBridge
+    ovs-vsctl add-port ovsBridge eth1
+    ovs-vsctl add-port ovsBridge vxlan0
+    ifconfig ovsBridge 192.168.7.1/24
+	
+#dnsmasq configuration	
+    echo "reached 5";
+    dnsmasq --enable-tftp --tftp-root=/var/www/htdocs --interface=ovsBridge --dhcp-range=192.168.7.1,192.168.7.100,255.255.255.0 --dhcp-match=IPXEBOOT,175 --dhcp-option=175,8:1:1 --dhcp-boot=undionly.kpxe,192.168.7.1 --server=8.8.4.4
+	
+#Strongswan configuration  
+	yum -y install strongswan
+	systemctl start strongswan;
+	systemctl enable strongswan;
+	cd /etc/strongswan/swanctl;
+	cp /home/vagrant/RemoteBooting/serverKey.pem private
+	cp /home/vagrant/RemoteBooting/strongswanKey.pem private
+	cp /home/vagrant/RemoteBooting/strongswanCert.pem x509ca
+    cp /home/vagrant/RemoteBooting/serverCert.pem x509
+	cp /home/vagrant/RemoteBooting/clientCert.pem x509
+	cp /home/vagrant/RemoteBooting/serverSwanctl.conf swanctl.conf
+	swanctl --load-all
+    swanctl -i -c net-net
+	
+#Etherate tools
+	cd /home/vagrant
+    git clone https://github.com/jwbensley/Etherate.git
+	cd Etherate/
+    ./configure.sh && make
+	
+   SHELL
+  # Can use different file for all shell commands too
+end
